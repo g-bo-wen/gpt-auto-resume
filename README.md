@@ -98,14 +98,14 @@ node node_modules/@tauri-apps/cli/tauri.js build --bundles deb,appimage
 
 1. **手动检查**：Actions → Build installers → Run workflow，仅上传产物，不创建 Release。相关文件的 PR 也运行构建，使用只读权限。
 2. **同步版本**：修改 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json`，更新本文“发布说明”章节，发布脚本直接读取该章节作为草稿 Release 正文。运行上述版本及发布脚本检查。
-3. **标签触发**：提交发布文件后，由维护者推送与应用版本完全一致的 `v<version>` 标签。当前版本为 `v0.1.0`；不匹配则失败。
+3. **标签触发**：提交发布文件后，由维护者推送与应用版本完全一致的 `v<version>` 标签。当前版本为 `v0.1.1`；不匹配则失败。
 4. **草稿上传**：只有全部平台构建成功后才生成草稿预发布 Release，上传五个安装包及 `SHA256SUMS`。重跑允许更新草稿，拒绝覆盖已公开 Release。
 5. **人工发布**：检查产物、校验值、平台限制、签名状态和实际验收后，手动公开草稿。
 
 ```powershell
 # 由维护者确认发布提交及版本后执行
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 构建任务使用 `contents: read`，草稿上传任务使用内置 `GITHUB_TOKEN` 的 `contents: write`，不需要个人访问令牌。当前流程未配置发行者签名密钥、Apple 公证或自动更新，也不执行任何真实 resume 或系统自启动操作。
