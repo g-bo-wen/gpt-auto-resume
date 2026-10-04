@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex Auto Resume",
+  "version": "0.1.0",
+  "identifier": "com.local.codex-auto-resume",
+  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
+  "app": { "windows": [{ "label": "main", "title": "Codex Auto Resume", "width": 1120, "height": 760, "minWidth": 850, "minHeight": 600 }], "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost" } },
+  "bundle": { "active": true, "targets": ["nsis"], "icon": ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"], "shortDescription": "Codex Desktop 自动恢复管理（自动恢复仅支持 Windows）", "macOS": { "signingIdentity": "-" }, "windows": { "nsis": { "installMode": "currentUser", "languages": ["SimpChinese", "English"] } } }
+}

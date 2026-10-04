@@ -1,0 +1,124 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/**'
+      - 'src-tauri/**'
+      - 'src/**'
+      - 'package*.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'index.html'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    name: ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - id: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - id: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - id: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          exit $LASTEXITCODE
+      - run: npm ci
+      - name: Verify release versions
+        run: node scripts/check-release.mjs
+      - name: Test release scripts
+        run: node --test scripts/release-checks.mjs
+      - run: npm test
+      - name: Test Rust fixtures
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+        # Cross-compiled Intel tests cannot execute on an Apple Silicon runner.
+        if: matrix.id != 'macos-x64'
+      - name: Compile Intel Mac test fixtures
+        if: matrix.id == 'macos-x64'
+        run: cargo test --locked --no-run --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Build installer
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Collect installers
+        run: node scripts/collect-installers.mjs '${{ matrix.id }}' '${{ matrix.target }}' '${{ matrix.bundles }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.id }}
+          path: release-installers/*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: release-installers
+      - name: Create or update draft prerelease
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const publish = require('./scripts/publish-release.cjs');
+            await publish({ github, context, core });
