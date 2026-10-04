@@ -93,7 +93,7 @@ jobs:
           args: --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
       - name: Collect installers
         run: node scripts/collect-installers.mjs '${{ matrix.id }}' '${{ matrix.target }}' '${{ matrix.bundles }}'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: installers-${{ matrix.id }}
           path: release-installers/*
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: installers-*
           merge-multiple: true
