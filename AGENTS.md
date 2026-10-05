@@ -12,7 +12,7 @@
 ## 项目结构
 - `src/`：React 管理界面，使用 Tauri invoke；没有直接发送或调试发送命令。
 - `src-tauri/src/engine.rs`：SQLite 状态机、一次性来源、授权、Attempt 与确认计数。
-- `desktop.rs`：只读能力发现、版本范围、Desktop 私有 IPC 消息适配。
+- `desktop.rs`：只读能力发现、本地参数 schema 校验、Desktop 私有 IPC 消息适配；版本仅用于诊断。
 - `sessions.rs`：只读有界解析本地 rollout，历史额度绑定 turn，最新用户事件立即废止旧终止证据。
 - `lib.rs`：单实例、串行后台 supervisor、命令、诊断、原生生命周期。
 

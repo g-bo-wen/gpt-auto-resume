@@ -226,10 +226,15 @@ impl Backend {
         let candidate = snapshot["watches"]
             .as_array()
             .and_then(|w| w.iter().find(|w| w["state"] == "ReadyToResume"))
-            .and_then(|w| w["threadId"].as_str())
-            .map(str::to_owned);
-        if let Some(thread) = candidate {
-            if let Err(reason) = self.desktop.check_thread(&thread) {
+            .cloned();
+        if let Some(candidate) = candidate {
+            let thread = candidate["threadId"].as_str().ok_or("观测格式错误")?;
+            let prompt = candidate["prompt"].as_str().ok_or("观测格式错误")?;
+            if let Err(reason) = self
+                .desktop
+                .check_send(thread, prompt)
+                .and_then(|_| self.desktop.check_thread(thread))
+            {
                 self.log_desktop_failure();
                 let previous = snapshot["observation"].clone();
                 let mut o: Observation =
@@ -805,6 +810,9 @@ pub fn observe_only() {
         let context = found.first().ok_or("本地 Desktop 会话不可用")?;
         let quota = desktop.quota(&context.0.thread_id)?;
         let list = desktop.list(&context.0.thread_id)?;
+        desktop.check_thread(&context.0.thread_id)?;
+        // Local schema validation only; never invoke the send tool in observe-only.
+        desktop.check_send(&context.0.thread_id, &Settings::default().default_prompt)?;
         let titles = sessions::desktop_titles(&list);
         let matched = found
             .iter()

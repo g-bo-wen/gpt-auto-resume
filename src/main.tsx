@@ -588,7 +588,10 @@ function App() {
                   {diag?.stage ? t('ui.stage.' + diag.stage, { defaultValue: diag.stage }) : '—'}
                 </dd>
                 <dt>{t('ui.versions')}</dt>
-                <dd>Desktop 26.930.3930.0 / Runtime 0.160.0</dd>
+                <dd>
+                  Desktop {diag?.desktopVersion ?? t('ui.unknown')} / Runtime{' '}
+                  {diag?.runtimeVersion ?? t('ui.unknown')}
+                </dd>
               </dl>
               <p className="hint">{t('ui.compatibilityHelp')}</p>
               <button disabled={busy} onClick={() => void work(() => native('open_data_folder'))}>

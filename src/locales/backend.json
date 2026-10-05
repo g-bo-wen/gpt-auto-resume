@@ -56,6 +56,9 @@
     "desktop.contentUnrecognized": "Desktop 响应内容无法解析 {{detail}}",
     "desktop.runtimeReadFailed": "读取 Runtime 版本失败",
     "desktop.capabilityIncomplete": "Desktop 接口能力不完整",
+    "desktop.schemaUnrecognized": "Desktop 工具参数协议无法识别，已停止自动恢复",
+    "desktop.argumentsIncompatible": "Desktop 工具参数不兼容，已停止自动恢复",
+    "desktop.threadResponseIncompatible": "Desktop 会话读取响应不兼容，已停止自动恢复",
     "desktop.windowsDiscoveryFailed": "Windows 只读发现失败",
     "desktop.frameTooLarge": "IPC 请求超过大小限制",
     "desktop.frameIncompatible": "Desktop 协议帧大小不兼容",
@@ -218,6 +221,9 @@
     "desktop.contentUnrecognized": "Desktop response content cannot be parsed {{detail}}",
     "desktop.runtimeReadFailed": "Runtime version could not be read",
     "desktop.capabilityIncomplete": "Desktop interface capabilities are incomplete",
+    "desktop.schemaUnrecognized": "Desktop tool argument schema could not be recognized; automatic resume stopped",
+    "desktop.argumentsIncompatible": "Desktop tool arguments are incompatible; automatic resume stopped",
+    "desktop.threadResponseIncompatible": "Desktop thread read response is incompatible; automatic resume stopped",
     "desktop.windowsDiscoveryFailed": "Windows read-only discovery failed",
     "desktop.frameTooLarge": "IPC request exceeds the size limit",
     "desktop.frameIncompatible": "Desktop protocol frame size is incompatible",
@@ -403,6 +409,9 @@
     "只读发现通过；没有发送消息": "desktop.readonlyPassed",
     "Desktop compatibility lost while confirming; no retry": "delivery.compatibilityLost",
     "USERPROFILE 不可用": "platform.userProfileUnavailable",
-    "本地 Desktop 会话不可用": "desktop.localUnavailable"
+    "本地 Desktop 会话不可用": "desktop.localUnavailable",
+    "Desktop 工具参数协议无法识别，已停止自动恢复": "desktop.schemaUnrecognized",
+    "Desktop 工具参数不兼容，已停止自动恢复": "desktop.argumentsIncompatible",
+    "Desktop 会话读取响应不兼容，已停止自动恢复": "desktop.threadResponseIncompatible"
   }
 }

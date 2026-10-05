@@ -5,14 +5,14 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     process::{Command, Stdio},
     time::Duration,
 };
 use uuid::Uuid;
 
-const DESKTOP_VERSION: &str = "26.930.3930.0";
-const RUNTIME_VERSION: &str = "0.160.0";
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+type Capabilities = HashMap<String, jsonschema::Validator>;
 pub fn hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -25,6 +25,7 @@ pub struct Desktop {
     pipe: Option<String>,
     version: Option<String>,
     runtime: Option<String>,
+    capabilities: Capabilities,
     last_failure: std::sync::Mutex<Option<Value>>,
 }
 impl Desktop {
@@ -98,53 +99,31 @@ impl Desktop {
             self.pipe = None;
             return Err("首版仅支持 Windows Native".into());
         }
-        self.version = Some(
-            run_ps("(Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop).Version.ToString()")?
-                .trim()
-                .into(),
-        );
-        if self.version.as_deref() != Some(DESKTOP_VERSION) {
-            self.pipe = None;
-            return Err("Desktop 版本不在已验证范围，已停止自动恢复".into());
-        }
-        let runtime = if runtime_path.is_empty() {
-            let base = std::env::var("LOCALAPPDATA").map_err(|_| "无法发现 Runtime")?;
-            let mut paths: Vec<_> =
-                walkdir::WalkDir::new(std::path::Path::new(&base).join("OpenAI/Codex/bin"))
-                    .max_depth(3)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                    .filter(|e| e.file_type().is_file() && e.file_name() == "codex.exe")
-                    .map(|e| e.into_path())
-                    .collect();
-            paths.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            paths.pop().ok_or("未发现本地 Codex Runtime")?
-        } else {
-            std::path::PathBuf::from(runtime_path)
-        };
-        // Argument boundaries are preserved; this executes --version only.
-        let output = hidden_command(runtime)
-            .arg("--version")
-            .output()
-            .map_err(|_| "Runtime 版本读取失败")?;
-        if !output.status.success() {
-            return Err("Runtime 版本读取失败".into());
-        }
-        self.runtime = Some(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .trim_start_matches("codex-cli ")
-                .into(),
-        );
-        if self.runtime.as_deref() != Some(RUNTIME_VERSION) {
-            self.pipe = None;
-            return Err("Runtime 版本不在已验证范围，已停止自动恢复".into());
-        }
+        // Versions are diagnostic only: this adapter communicates through Desktop IPC,
+        // not through the CLI runtime. Missing metadata cannot determine compatibility.
+        let mut version_command = hidden_command("pwsh.exe");
+        version_command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop).Version.ToString()",
+        ]);
+        self.version = diagnostic_output(version_command, Duration::from_secs(5))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        self.runtime = runtime_version(runtime_path);
         if let Some(path) = &self.pipe {
-            if catalog(path).is_ok() {
-                return Ok(());
+            match catalog(path) {
+                Ok(capabilities) => {
+                    self.capabilities = capabilities;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.pipe = None;
+                    self.capabilities.clear();
+                }
             }
-            self.pipe = None;
         }
         let listing = run_ps("[IO.Directory]::GetFiles('\\\\.\\pipe\\') | Where-Object { [IO.Path]::GetFileName($_) -like 'codex-browser-use-*' } | ConvertTo-Json -Compress")?;
         let value: Value =
@@ -158,18 +137,38 @@ impl Desktop {
             _ => vec![],
         };
         let mut matches = vec![];
+        let mut capability_failure = None;
         for path in paths.into_iter().take(64) {
-            if catalog(&path).is_ok() {
-                matches.push(path);
+            match catalog(&path) {
+                Ok(capabilities) => matches.push((path, capabilities)),
+                Err(reason) if is_capability_failure(&reason) => {
+                    capability_failure = Some(reason);
+                }
+                Err(_) => {}
             }
         }
         if matches.len() != 1 {
+            if matches.is_empty() {
+                if let Some(reason) = capability_failure {
+                    return Err(reason);
+                }
+            }
             return Err("Desktop 接口未找到或存在多个匹配端点，已停止自动恢复".into());
         }
-        self.pipe = matches.pop();
+        let (path, capabilities) = matches.pop().unwrap();
+        self.pipe = Some(path);
+        self.capabilities = capabilities;
         Ok(())
     }
+    fn validate_arguments(&self, tool: &str, arguments: &Value) -> Result<(), String> {
+        validate_arguments(&self.capabilities, tool, arguments)
+    }
+    pub fn check_send(&self, thread: &str, prompt: &str) -> Result<(), String> {
+        self.validate_arguments("send_message_to_thread", &send_arguments(thread, prompt))
+    }
     pub fn tool(&self, context: &str, tool: &str, arguments: Value) -> Result<Value, String> {
+        // Validate actual arguments (including the unchanged user prompt) before any IPC write.
+        self.validate_arguments(tool, &arguments)?;
         let label = diagnostic_tool_name(tool);
         let pipe = self
             .pipe
@@ -240,7 +239,8 @@ impl Desktop {
         self.tool(context, "list_threads", json!({"limit":50}))
     }
     pub fn check_thread(&self, thread: &str) -> Result<(), String> {
-        self.tool(thread,"read_thread",json!({"threadId":thread,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":0})).map(|_|())
+        let value = self.tool(thread,"read_thread",json!({"threadId":thread,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":0}))?;
+        check_thread_response(&value, thread)
     }
     pub fn send(
         &self,
@@ -248,6 +248,9 @@ impl Desktop {
         home: &std::path::Path,
         authorized: impl Fn() -> bool,
     ) -> Delivery {
+        if let Err(reason) = self.check_send(&submission.thread_id, &submission.prompt) {
+            return Delivery::Rejected(reason);
+        }
         // Invocation is exclusively a supervisor effect, never a UI test button.
         let before = crate::sessions::discover(home)
             .into_iter()
@@ -267,7 +270,7 @@ impl Desktop {
         let response = self.tool(
             &submission.thread_id,
             "send_message_to_thread",
-            json!({"threadId":submission.thread_id,"hostId":"local","prompt":submission.prompt}),
+            send_arguments(&submission.thread_id, &submission.prompt),
         );
         match response {
             Ok(value) => classify_delivery(&value, &submission.thread_id),
@@ -447,28 +450,173 @@ pub fn parse_quota(value: &Value, scope: &str, captured: &str) -> Option<Quota> 
         reset_at: p["resetsAt"].as_i64().or_else(|| p["resets_at"].as_i64()),
     })
 }
-fn catalog(path: &str) -> Result<(), String> {
-    let v = rpc(
-        path,
-        "tools/list",
-        json!({"threadStartKind":"all"}),
-        Duration::from_millis(600),
-    )?;
-    let tools = v["result"]["tools"].as_array().ok_or("接口能力不可识别")?;
+fn send_arguments(thread: &str, prompt: &str) -> Value {
+    json!({"threadId":thread,"hostId":"local","prompt":prompt})
+}
+
+fn check_thread_response(value: &Value, target: &str) -> Result<(), String> {
+    let thread = &value["thread"];
+    let id = thread["id"]
+        .as_str()
+        .or_else(|| thread["threadId"].as_str());
+    if id != Some(target) || !value["turns"].is_array() {
+        return Err("Desktop 会话读取响应不兼容，已停止自动恢复".into());
+    }
+    if thread["hostId"].as_str() != Some("local") {
+        return Err("Desktop 会话读取响应不兼容，已停止自动恢复".into());
+    }
+    Ok(())
+}
+
+fn validate_arguments(
+    capabilities: &Capabilities,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    let label = diagnostic_tool_name(tool);
+    let validator = capabilities
+        .get(tool)
+        .ok_or_else(|| format!("Desktop 接口能力不完整 [tool={label}]"))?;
+    // Do not expose validator errors: they can contain the entire resume prompt.
+    if !validator.is_valid(arguments) {
+        return Err(format!(
+            "Desktop 工具参数不兼容，已停止自动恢复 [tool={label}]"
+        ));
+    }
+    Ok(())
+}
+
+fn is_capability_failure(reason: &str) -> bool {
+    let message = message_from_text(reason);
+    let code = if message.code == "backend.withDetails" {
+        message
+            .params
+            .get("message")
+            .and_then(|v| v["code"].as_str())
+            .unwrap_or("")
+    } else {
+        &message.code
+    };
+    matches!(
+        code,
+        "desktop.capabilityIncomplete" | "desktop.schemaUnrecognized"
+    )
+}
+
+fn parse_capabilities(value: &Value) -> Result<Capabilities, String> {
+    if value.get("error").is_some() {
+        return Err("Desktop 接口能力不完整".into());
+    }
+    let tools = value["result"]["tools"]
+        .as_array()
+        .ok_or("Desktop 接口能力不完整")?;
+    let mut capabilities = HashMap::new();
     for name in [
         "send_message_to_thread",
         "list_threads",
         "read_thread",
         "get_usage_limits",
     ] {
-        if !tools
+        let mut matching = tools
             .iter()
-            .any(|t| t["namespace"] == "codex_app" && t["name"] == name)
-        {
-            return Err("Desktop 接口能力不完整".into());
+            .filter(|t| t["namespace"] == "codex_app" && t["name"] == name);
+        let tool = matching
+            .next()
+            .ok_or_else(|| format!("Desktop 接口能力不完整 [tool={name}]"))?;
+        if matching.next().is_some() {
+            return Err(format!("Desktop 接口能力不完整 [tool={name}]"));
         }
+        let schema = tool
+            .get("inputSchema")
+            .filter(|s| s.is_object())
+            .ok_or_else(|| format!("Desktop 工具参数协议无法识别，已停止自动恢复 [tool={name}]"))?;
+        // default-features=false disables HTTP/file reference retrieval. Local $defs
+        // and combinators remain supported by the standard JSON Schema validator.
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .should_ignore_unknown_formats(false)
+            .build(schema)
+            .map_err(|_| format!("Desktop 工具参数协议无法识别，已停止自动恢复 [tool={name}]"))?;
+        capabilities.insert(name.to_owned(), validator);
     }
-    Ok(())
+    Ok(capabilities)
+}
+
+fn catalog(path: &str) -> Result<Capabilities, String> {
+    let v = rpc(
+        path,
+        "tools/list",
+        json!({"threadStartKind":"all"}),
+        Duration::from_millis(600),
+    )?;
+    parse_capabilities(&v)
+}
+
+fn runtime_version(runtime_path: &str) -> Option<String> {
+    let runtime = if runtime_path.is_empty() {
+        let base = std::env::var("LOCALAPPDATA").ok()?;
+        let mut paths: Vec<_> =
+            walkdir::WalkDir::new(std::path::Path::new(&base).join("OpenAI/Codex/bin"))
+                .max_depth(3)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_file() && e.file_name() == "codex.exe")
+                .map(|e| e.into_path())
+                .collect();
+        paths.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        paths.pop()?
+    } else {
+        std::path::PathBuf::from(runtime_path)
+    };
+    // This is metadata only; never start an App Server or CLI writer.
+    let mut command = hidden_command(runtime);
+    command.arg("--version");
+    let output = diagnostic_output(command, Duration::from_secs(2))?;
+    let version = output.trim().trim_start_matches("codex-cli ").to_owned();
+    (!version.is_empty()).then_some(version)
+}
+
+fn diagnostic_output(command: Command, timeout: Duration) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let mut command = tokio::process::Command::from(command);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let result = tokio::time::timeout(timeout, async {
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()?
+                .take(4097)
+                .read_to_end(&mut bytes)
+                .await
+                .ok()?;
+            if bytes.len() > 4096 {
+                return None;
+            }
+            if !child.wait().await.ok()?.success() {
+                return None;
+            }
+            String::from_utf8(bytes).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if result.is_none() {
+            // Reap the metadata child when possible; drop still requests a kill
+            // if cleanup itself cannot finish within the bound.
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.kill()).await;
+        }
+        result
+    })
 }
 fn hidden_command(exe: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut c = Command::new(exe);
@@ -593,6 +741,191 @@ fn rpc_transport(
 }
 #[cfg(test)]
 mod tests {
+    fn capability_fixture() -> Value {
+        let mut tools = vec![];
+        for (name, schema) in [
+            (
+                "get_usage_limits",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            ),
+            (
+                "list_threads",
+                json!({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false}),
+            ),
+            (
+                "read_thread",
+                json!({"type":"object","properties":{"threadId":{"type":"string"},"hostId":{"type":"string"},"turnLimit":{"type":"integer"},"includeOutputs":{"type":"boolean"},"maxOutputCharsPerItem":{"type":"integer"}},"required":["threadId"],"additionalProperties":false}),
+            ),
+            (
+                "send_message_to_thread",
+                json!({"type":"object","properties":{"threadId":{"type":"string"},"hostId":{"enum":["local"]},"prompt":{"type":"string","minLength":1}},"required":["threadId","prompt"],"additionalProperties":false}),
+            ),
+        ] {
+            tools.push(json!({"namespace":"codex_app","name":name,"inputSchema":schema}));
+        }
+        json!({"result":{"tools":tools}})
+    }
+
+    #[test]
+    fn capabilities_accept_actual_calls_without_version_metadata() {
+        let desktop = Desktop {
+            capabilities: parse_capabilities(&capability_fixture()).unwrap(),
+            ..Default::default()
+        };
+        assert!(desktop.version.is_none() && desktop.runtime.is_none());
+        assert!(desktop.check_send("thread", "原文 resume").is_ok());
+        assert!(desktop
+            .validate_arguments("get_usage_limits", &json!({}))
+            .is_ok());
+        assert!(desktop
+            .validate_arguments("list_threads", &json!({"limit":50}))
+            .is_ok());
+        assert!(desktop.validate_arguments("read_thread", &json!({"threadId":"thread","hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":0})).is_ok());
+        assert!(runtime_version("this-runtime-does-not-exist.exe").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_metadata_is_bounded_and_failure_is_optional() {
+        fn command(script: &str) -> Command {
+            let mut command = hidden_command("pwsh.exe");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ]);
+            command
+        }
+        assert_eq!(
+            diagnostic_output(
+                command("[Console]::Write('codex-cli fixture')"),
+                Duration::from_secs(10)
+            )
+            .as_deref(),
+            Some("codex-cli fixture")
+        );
+        assert!(diagnostic_output(
+            command("[Console]::Write('x' * 4097)"),
+            Duration::from_secs(10)
+        )
+        .is_none());
+        assert!(diagnostic_output(command("exit 1"), Duration::from_secs(10)).is_none());
+        let started = std::time::Instant::now();
+        assert!(diagnostic_output(
+            command("[Threading.Thread]::Sleep(30000)"),
+            Duration::from_millis(100)
+        )
+        .is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn missing_duplicate_wrong_namespace_and_unreadable_schemas_block() {
+        for variant in 0..6 {
+            let mut value = capability_fixture();
+            let tools = value["result"]["tools"].as_array_mut().unwrap();
+            match variant {
+                0 => {
+                    tools.pop();
+                }
+                1 => {
+                    tools.push(tools[3].clone());
+                }
+                2 => {
+                    tools[3]["namespace"] = json!("other");
+                }
+                3 => {
+                    tools[3].as_object_mut().unwrap().remove("inputSchema");
+                }
+                4 => {
+                    tools[3]["inputSchema"] = json!({"type":"not-a-json-schema-type"});
+                }
+                _ => {
+                    tools[3]["inputSchema"] = json!({"$ref":"https://example.invalid/schema.json"});
+                }
+            }
+            let reason = parse_capabilities(&value).err().expect("must block");
+            assert!(is_capability_failure(&reason), "variant {variant}");
+        }
+        let mut value = capability_fixture();
+        value["result"]["tools"][3]["inputSchema"] =
+            json!({"$ref":"file:///C:/private/schema.json"});
+        assert!(parse_capabilities(&value).is_err());
+    }
+
+    #[test]
+    fn schema_changes_reject_before_ipc_without_exposing_prompt() {
+        for schema in [
+            json!({"type":"object","required":["newRequiredField"]}),
+            json!({"type":"object","properties":{"hostId":{"enum":["remote"]}}}),
+            json!({"type":"object","properties":{"prompt":{"type":"integer"}}}),
+            json!({"type":"object","properties":{"prompt":{"maxLength":3}}}),
+            json!({"type":"object","properties":{"prompt":{"pattern":"^different$"}}}),
+            json!({"type":"object","properties":{"threadId":{"type":"string"}},"additionalProperties":false}),
+        ] {
+            let mut value = capability_fixture();
+            value["result"]["tools"][3]["inputSchema"] = schema;
+            // No pipe is supplied. Schema errors must occur before connection/IPC.
+            let desktop = Desktop {
+                capabilities: parse_capabilities(&value).unwrap(),
+                ..Default::default()
+            };
+            let reason = desktop
+                .tool(
+                    "thread",
+                    "send_message_to_thread",
+                    send_arguments("thread", "PRIVATE_PROMPT"),
+                )
+                .unwrap_err();
+            assert!(reason.starts_with("Desktop 工具参数不兼容"));
+            assert!(!reason.contains("PRIVATE_PROMPT"));
+            assert_eq!(message_from_text(&reason).code, "backend.withDetails");
+        }
+    }
+
+    #[test]
+    fn additive_schema_changes_and_local_refs_remain_compatible() {
+        let mut value = capability_fixture();
+        let schema = &mut value["result"]["tools"][3]["inputSchema"];
+        schema["$defs"] = json!({"text":{"type":"string"}});
+        schema["properties"]["prompt"] = json!({"$ref":"#/$defs/text"});
+        schema["properties"]["newOptionalField"] =
+            json!({"anyOf":[{"type":"string"},{"type":"null"}]});
+        schema["allOf"] = json!([{"properties":{"hostId":{"const":"local"}}}]);
+        let desktop = Desktop {
+            capabilities: parse_capabilities(&value).unwrap(),
+            ..Default::default()
+        };
+        assert!(desktop.check_send("thread", "原文不改写").is_ok());
+        assert_eq!(
+            send_arguments("thread", "原文不改写")["prompt"],
+            "原文不改写"
+        );
+        assert!(desktop
+            .validate_arguments("list_threads", &json!({"limit":51}))
+            .is_err());
+    }
+
+    #[test]
+    fn read_thread_response_requires_target_and_turn_structure() {
+        assert!(check_thread_response(
+            &json!({"thread":{"id":"target","hostId":"local"},"turns":[]}),
+            "target"
+        )
+        .is_ok());
+        for response in [
+            json!({}),
+            json!({"thread":{"id":"target"},"turns":[]}),
+            json!({"thread":{"id":"target","hostId":null},"turns":[]}),
+            json!({"thread":{"id":"other"},"turns":[]}),
+            json!({"thread":{"id":"target"},"turns":{}}),
+            json!({"thread":{"id":"target","hostId":"remote"},"turns":[]}),
+        ] {
+            assert!(check_thread_response(&response, "target").is_err());
+        }
+    }
     #[cfg(not(windows))]
     #[test]
     fn experimental_platform_blocks_before_windows_discovery() {
